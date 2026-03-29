@@ -1,0 +1,521 @@
+#!/usr/bin/env bash
+
+# ============================================================
+# gitpack — Git-aware archive tool
+# Version: 2.0.0
+# License: MIT
+# ============================================================
+
+set -euo pipefail
+
+# ── Version ──────────────────────────────────────────────────
+GITPACK_VERSION="2.0.0"
+
+# ── Defaults ─────────────────────────────────────────────────
+MODE="tracked"
+OUTPUT=""
+FORMAT="zip"
+DRY_RUN=false
+VERBOSE=false
+QUIET=false
+PREFIX=""
+BASE_DIR=""
+SINCE=""
+DIFF_MODE=false
+DIFF_C1=""
+DIFF_C2=""
+NO_GIT=false
+INIT_IF_MISSING=false
+NO_EMPTY=false
+MAX_SIZE=""
+IGNORE_FILE=".gitpackignore"
+SELECT_FILE=".gitpackselect"
+USE_SELECT=false
+COMPRESSION_LEVEL=""
+TIMESTAMP=false
+OVERWRITE=false
+LIST_ONLY=false
+
+INCLUDES=()
+EXCLUDES=()
+
+TMP_FILE=""
+
+# ── Cleanup ───────────────────────────────────────────────────
+cleanup() {
+  [[ -n "${TMP_FILE:-}" && -f "$TMP_FILE" ]] && rm -f "$TMP_FILE"
+  return 0
+}
+trap cleanup EXIT
+
+# ── Logging ──────────────────────────────────────────────────
+# ANSI color codes — disabled when not a TTY or NOCOLOR is set
+if [[ -t 2 && -z "${NO_COLOR:-}" && -z "${NOCOLOR:-}" ]]; then
+  C_RESET="\033[0m"
+  C_BOLD="\033[1m"
+  C_GREEN="\033[0;32m"
+  C_YELLOW="\033[0;33m"
+  C_RED="\033[0;31m"
+  C_CYAN="\033[0;36m"
+  C_DIM="\033[2m"
+else
+  C_RESET="" C_BOLD="" C_GREEN="" C_YELLOW="" C_RED="" C_CYAN="" C_DIM=""
+fi
+
+log()   { [[ "$VERBOSE" == true ]] && echo -e "${C_DIM}[INFO]${C_RESET} $*" >&2 || true; }
+info()  { [[ "$QUIET"   != true ]] && echo -e "${C_CYAN}[gitpack]${C_RESET} $*"         || true; }
+ok()    { [[ "$QUIET"   != true ]] && echo -e "${C_GREEN}✔${C_RESET} $*"                || true; }
+warn()  { echo -e "${C_YELLOW}[WARN]${C_RESET} $*" >&2; }
+error() { echo -e "${C_RED}[ERROR]${C_RESET} $*" >&2; exit 1; }
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+detect_os() {
+  local u
+  u=$(uname -s 2>/dev/null || echo "unknown")
+  case "$u" in
+    Linux*)          echo "linux"   ;;
+    Darwin*)         echo "mac"     ;;
+    MINGW*|MSYS*|CYGWIN*) echo "windows" ;;
+    *)               echo "unknown" ;;
+  esac
+}
+
+OS=$(detect_os)
+
+# ── Help ─────────────────────────────────────────────────────
+show_help() {
+  cat <<EOF
+${C_BOLD}gitpack${C_RESET} v${GITPACK_VERSION} — Git-aware archive tool
+
+${C_BOLD}USAGE${C_RESET}
+  gitpack [options]
+
+${C_BOLD}FILE SELECTION${C_RESET}
+  -m, --mode <mode>         File collection mode (default: tracked)
+  --since <commit>          Files changed since this commit/ref
+  --diff <c1> <c2>          Files changed between two commits
+  --include <pattern>       Include files matching regex (repeatable)
+  --exclude <pattern>       Exclude files matching regex (repeatable)
+  --max-size <size>         Skip files larger than size (e.g. 1M, 500K, 2G)
+  --use-select              Enable .gitpackselect opt-in list
+  --select-file <file>      Use a custom select file (enables select mode)
+  --ignore-file <file>      Use a custom ignore file (default: .gitpackignore)
+  --no-empty                Exit with error if no files are selected
+
+${C_BOLD}OUTPUT${C_RESET}
+  -o, --output <file>       Output archive path (auto-named if omitted)
+  --format zip|tar.gz       Archive format (default: zip)
+  --prefix <path>           Path prefix added inside the archive
+  --timestamp               Append ISO timestamp to output filename
+  --overwrite               Overwrite existing output file without prompting
+
+${C_BOLD}BEHAVIOR${C_RESET}
+  --dry-run                 Print selected files; do not create archive
+  --list                    Same as --dry-run with count summary
+  --no-git                  Run without Git; scan filesystem instead
+  --init-if-missing         git init if not inside a repository
+  --base-dir <dir>          Change to this directory before running
+
+${C_BOLD}DISPLAY${C_RESET}
+  --verbose                 Show detailed progress
+  --quiet                   Suppress all non-error output
+  --no-color                Disable color output
+  -V, --version             Print version and exit
+  -h, --help                Show this help
+
+${C_BOLD}MODES${C_RESET}
+  tracked     Git-tracked files only (default)
+  staged      Files staged for commit (git diff --cached)
+  modified    Modified but unstaged files
+  untracked   Untracked, non-ignored files
+  ignored     Files ignored by .gitignore
+  all         tracked + untracked
+  everything  All files except .git/ (filesystem scan)
+
+${C_BOLD}PROJECT FILES${C_RESET}
+  .gitpackignore  Regex exclusion patterns (applied automatically)
+  .gitpackselect  Explicit include list — files or regex (opt-in)
+
+${C_BOLD}EXAMPLES${C_RESET}
+  gitpack                                      # archive tracked files → gitpack.zip
+  gitpack -m modified -o hotfix.zip            # only modified files
+  gitpack -m all --format tar.gz               # tracked+untracked as tar.gz
+  gitpack --dry-run -m staged                  # preview staged files
+  gitpack --include '\\.go\$' --exclude vendor  # Go files, skip vendor/
+  gitpack --max-size 500K -m everything        # skip large files
+  gitpack --diff HEAD~1 HEAD -o patch.zip      # files changed in last commit
+  gitpack --since HEAD~3 -o recent.zip         # files touched in last 3 commits
+  gitpack --prefix myapp/ -m tracked           # add path prefix inside zip
+  gitpack --timestamp -m tracked               # gitpack-20260101T120000.zip
+  gitpack --no-git -o backup.zip               # archive without Git
+
+EOF
+}
+
+# ── Argument parsing ─────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m|--mode)         [[ $# -lt 2 ]] && error "Missing value for $1"; MODE="$2"; shift 2 ;;
+    -o|--output)       [[ $# -lt 2 ]] && error "Missing value for $1"; OUTPUT="$2"; shift 2 ;;
+    --format)          [[ $# -lt 2 ]] && error "Missing value for $1"; FORMAT="$2"; shift 2 ;;
+    --dry-run|--list)  DRY_RUN=true; LIST_ONLY=true; shift ;;
+    --verbose)         VERBOSE=true; shift ;;
+    --quiet)           QUIET=true; shift ;;
+    --no-color)        C_RESET="" C_BOLD="" C_GREEN="" C_YELLOW="" C_RED="" C_CYAN="" C_DIM=""; shift ;;
+    --prefix)          [[ $# -lt 2 ]] && error "Missing value for $1"; PREFIX="$2"; shift 2 ;;
+    --base-dir)        [[ $# -lt 2 ]] && error "Missing value for $1"; BASE_DIR="$2"; shift 2 ;;
+    --since)           [[ $# -lt 2 ]] && error "Missing value for $1"; SINCE="$2"; shift 2 ;;
+    --diff)            [[ $# -lt 3 ]] && error "--diff requires two commits: --diff <c1> <c2>"
+                       DIFF_MODE=true; DIFF_C1="$2"; DIFF_C2="$3"; shift 3 ;;
+    --include)         [[ $# -lt 2 ]] && error "Missing value for $1"; INCLUDES+=("$2"); shift 2 ;;
+    --exclude)         [[ $# -lt 2 ]] && error "Missing value for $1"; EXCLUDES+=("$2"); shift 2 ;;
+    --max-size)        [[ $# -lt 2 ]] && error "Missing value for $1"; MAX_SIZE="$2"; shift 2 ;;
+    --ignore-file)     [[ $# -lt 2 ]] && error "Missing value for $1"; IGNORE_FILE="$2"; shift 2 ;;
+    --use-select)      USE_SELECT=true; shift ;;
+    --select-file)     [[ $# -lt 2 ]] && error "Missing value for $1"; SELECT_FILE="$2"; USE_SELECT=true; shift 2 ;;
+    --no-empty)        NO_EMPTY=true; shift ;;
+    --no-git)          NO_GIT=true; shift ;;
+    --init-if-missing) INIT_IF_MISSING=true; shift ;;
+    --timestamp)       TIMESTAMP=true; shift ;;
+    --overwrite)       OVERWRITE=true; shift ;;
+    -V|--version)      echo "gitpack $GITPACK_VERSION"; exit 0 ;;
+    -h|--help)         show_help; exit 0 ;;
+    *)                 error "Unknown argument: $1 (run 'gitpack --help' for usage)" ;;
+  esac
+done
+
+# ── Validate format ───────────────────────────────────────────
+case "$FORMAT" in
+  zip|tar.gz) ;;
+  *) error "Unsupported format: '$FORMAT'. Choose zip or tar.gz" ;;
+esac
+
+# ── Validate mode ─────────────────────────────────────────────
+case "$MODE" in
+  tracked|staged|modified|untracked|ignored|all|everything) ;;
+  *) error "Invalid mode: '$MODE'. Valid modes: tracked staged modified untracked ignored all everything" ;;
+esac
+
+# ── Build output name ─────────────────────────────────────────
+if [[ -z "$OUTPUT" && "$DRY_RUN" == false ]]; then
+  local_base="gitpack"
+  if [[ "$TIMESTAMP" == true ]]; then
+    local_base="gitpack-$(date -u +%Y%m%dT%H%M%S)"
+  fi
+  case "$FORMAT" in
+    zip)    OUTPUT="${local_base}.zip"    ;;
+    tar.gz) OUTPUT="${local_base}.tar.gz" ;;
+  esac
+  log "No output path given — defaulting to: $OUTPUT"
+fi
+
+# ── Base dir ──────────────────────────────────────────────────
+if [[ -n "$BASE_DIR" ]]; then
+  [[ -d "$BASE_DIR" ]] || error "Base directory not found: $BASE_DIR"
+  cd "$BASE_DIR" || error "Cannot cd into: $BASE_DIR"
+fi
+
+# ── Git validation ────────────────────────────────────────────
+ensure_git() {
+  if ! command_exists git; then
+    if [[ "$NO_GIT" == true ]]; then
+      warn "git not found — running in --no-git mode"
+      return
+    fi
+    error "git not found. Install git, or use --no-git to skip Git integration."
+  fi
+
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [[ "$INIT_IF_MISSING" == true ]]; then
+      warn "Not a Git repository — initializing with 'git init'"
+      git init >/dev/null
+    elif [[ "$NO_GIT" == true ]]; then
+      warn "Not a Git repository — running in --no-git mode"
+    else
+      error "Not a Git repository. Use --no-git or --init-if-missing."
+    fi
+  fi
+}
+
+ensure_git
+
+# ── File collection ───────────────────────────────────────────
+collect_files() {
+  if [[ "$NO_GIT" == true ]]; then
+    find . -type f ! -path "./.git/*"
+    return
+  fi
+
+  if [[ "$DIFF_MODE" == true ]]; then
+    git diff --name-only "$DIFF_C1" "$DIFF_C2" -- | while IFS= read -r f; do
+      [[ -f "$f" ]] && echo "$f"
+    done
+    return
+  fi
+
+  if [[ -n "$SINCE" ]]; then
+    git diff --name-only "$SINCE" HEAD -- | while IFS= read -r f; do
+      [[ -f "$f" ]] && echo "$f"
+    done
+    return
+  fi
+
+  case "$MODE" in
+    tracked)    git ls-files ;;
+    staged)     git diff --name-only --cached ;;
+    modified)   git diff --name-only ;;
+    untracked)  git ls-files --others --exclude-standard ;;
+    ignored)    git ls-files --others -i --exclude-standard ;;
+    all)        { git ls-files; git ls-files --others --exclude-standard; } ;;
+    everything) find . -type f ! -path "./.git/*" ;;
+    *)          error "Invalid mode: '$MODE'. Valid: tracked staged modified untracked ignored all everything" ;;
+  esac
+}
+
+# ── Pattern/ignore helpers ────────────────────────────────────
+load_patterns_from_file() {
+  local fp="$1"
+  [[ -f "$fp" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[! ]*}"}"  # ltrim
+    line="${line%"${line##*[! ]}"}"  # rtrim
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    echo "$line"
+  done < "$fp"
+}
+
+apply_ignore_file() {
+  local files="$1"
+  [[ -f "$IGNORE_FILE" ]] || { echo "$files"; return; }
+  local pattern
+  while IFS= read -r pattern; do
+    files=$(printf "%s\n" "$files" | grep -Ev "$pattern" || true)
+  done < <(load_patterns_from_file "$IGNORE_FILE")
+  echo "$files"
+}
+
+apply_filters() {
+  local files="$1"
+  for pattern in "${INCLUDES[@]+"${INCLUDES[@]}"}"; do
+    files=$(printf "%s\n" "$files" | grep -E "$pattern" || true)
+  done
+  for pattern in "${EXCLUDES[@]+"${EXCLUDES[@]}"}"; do
+    files=$(printf "%s\n" "$files" | grep -Ev "$pattern" || true)
+  done
+  echo "$files"
+}
+
+collect_select_files() {
+  local universe pattern selected=""
+  universe=$(find . -type f ! -path "./.git/*")
+  while IFS= read -r pattern; do
+    if [[ -f "$pattern" || -f "./$pattern" ]]; then
+      selected+="$pattern"$'\n'
+      continue
+    fi
+    local matched
+    matched=$(printf "%s\n" "$universe" | grep -E "$pattern" || true)
+    if [[ -n "$matched" ]]; then
+      selected+="$matched"$'\n'
+    else
+      warn "Pattern in $SELECT_FILE matched no files: $pattern"
+    fi
+  done < <(load_patterns_from_file "$SELECT_FILE")
+  printf "%s" "$selected" | awk 'NF' | sort -u
+}
+
+# ── Size filter ───────────────────────────────────────────────
+parse_size() {
+  local s upper
+  s="$1"
+  upper=$(printf "%s" "$s" | tr '[:lower:]' '[:upper:]')
+  if [[ "$upper" =~ ^[0-9]+$ ]]; then
+    echo "$upper"; return
+  fi
+  if [[ "$upper" =~ ^([0-9]+)(K|KB|M|MB|G|GB)$ ]]; then
+    local v="${BASH_REMATCH[1]}" u="${BASH_REMATCH[2]}"
+    case "$u" in
+      K|KB) echo $(( v * 1024 ))            ;;
+      M|MB) echo $(( v * 1024 * 1024 ))     ;;
+      G|GB) echo $(( v * 1024 * 1024 * 1024 )) ;;
+    esac
+    return
+  fi
+  error "Invalid --max-size value: '$s'. Examples: 500K, 1M, 2G"
+}
+
+file_size() {
+  local f="$1"
+  stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || wc -c < "$f" | tr -d '[:space:]'
+}
+
+apply_size_filter() {
+  local max_bytes
+  max_bytes=$(parse_size "$MAX_SIZE")
+  while IFS= read -r f; do
+    [[ ! -f "$f" ]] && continue
+    local sz
+    sz=$(file_size "$f")
+    (( sz <= max_bytes )) && echo "$f"
+  done
+}
+
+# ── Archive tools check ───────────────────────────────────────
+ensure_archive_tools() {
+  case "$FORMAT" in
+    zip)
+      command_exists zip && return
+      [[ "$OS" == "windows" ]] && command_exists powershell.exe && return
+      error "'zip' command not found. Install it (e.g. 'apt install zip') or use --format tar.gz"
+      ;;
+    tar.gz)
+      command_exists tar || error "'tar' command not found."
+      ;;
+  esac
+}
+
+# ── Zip creation ──────────────────────────────────────────────
+create_zip_archive() {
+  local list="$1" out="$2"
+
+  if command_exists zip; then
+    local zip_opts=(-q)
+    [[ -n "$PREFIX" ]] && zip_opts+=(-j)   # strip paths when prefixing manually
+    [[ "$VERBOSE" == true ]] && zip_opts=()
+
+    if [[ -n "$PREFIX" ]]; then
+      # Build a temp dir with the prefix structure to get proper paths inside zip
+      local tmp_dir
+      tmp_dir=$(mktemp -d)
+      while IFS= read -r f; do
+        [[ -z "$f" || ! -f "$f" ]] && continue
+        local dest="$tmp_dir/$PREFIX$f"
+        mkdir -p "$(dirname "$dest")"
+        cp "$f" "$dest"
+      done < "$list"
+      (cd "$tmp_dir" && find . -type f | zip "${zip_opts[@]}" "$(realpath "$out")" -@)
+      rm -rf "$tmp_dir"
+    else
+      zip "${zip_opts[@]}" "$out" -@ < "$list"
+    fi
+    return
+  fi
+
+  if [[ "$OS" == "windows" ]] && command_exists powershell.exe; then
+    GITPACK_OUTPUT="$out" GITPACK_LIST="$list" \
+    powershell.exe -NoProfile -Command '
+      $ErrorActionPreference = "Stop"
+      $out  = $env:GITPACK_OUTPUT
+      $list = $env:GITPACK_LIST
+      if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Force }
+      $items = Get-Content -LiteralPath $list | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+      if ($items.Count -eq 0) { New-Item -ItemType File -Path $out | Out-Null }
+      else { Compress-Archive -Path $items -DestinationPath $out -Force }
+    ' >/dev/null
+    return
+  fi
+
+  error "Cannot create zip archive on this platform."
+}
+
+# ── tar.gz creation ───────────────────────────────────────────
+create_targz_archive() {
+  local list="$1" out="$2"
+
+  if [[ -n "$PREFIX" ]]; then
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    while IFS= read -r f; do
+      [[ -z "$f" || ! -f "$f" ]] && continue
+      local dest="$tmp_dir/$PREFIX$f"
+      mkdir -p "$(dirname "$dest")"
+      cp "$f" "$dest"
+    done < "$list"
+    (cd "$tmp_dir" && find . -type f | tar -czf "$(realpath "$out")" -T -)
+    rm -rf "$tmp_dir"
+  else
+    tar -czf "$out" -T "$list"
+  fi
+}
+
+# ── Collect files ─────────────────────────────────────────────
+TMP_FILE=$(mktemp)
+
+if [[ "$USE_SELECT" == true ]]; then
+  [[ -f "$SELECT_FILE" ]] || error "Select file not found: $SELECT_FILE"
+  if [[ -f "$IGNORE_FILE" ]]; then
+    error "Cannot use '$SELECT_FILE' and '$IGNORE_FILE' together. Remove one of them."
+  fi
+  FILES=$(collect_select_files)
+else
+  FILES=$(collect_files | sort -u)
+  FILES=$(apply_ignore_file "$FILES")
+
+  if [[ -f "$SELECT_FILE" ]]; then
+    warn "$SELECT_FILE found but select mode is off. Use --use-select to apply it."
+  fi
+fi
+
+FILES=$(apply_filters "$FILES")
+
+if [[ -n "$MAX_SIZE" ]]; then
+  FILES=$(printf "%s\n" "$FILES" | apply_size_filter)
+fi
+
+# Remove blank lines and write to temp file
+printf "%s\n" "$FILES" | grep -v '^$' > "$TMP_FILE" || true
+
+FILE_COUNT=$(wc -l < "$TMP_FILE" | tr -d '[:space:]')
+
+# ── Empty check ───────────────────────────────────────────────
+if [[ "$FILE_COUNT" -eq 0 ]]; then
+  [[ "$NO_EMPTY" == true ]] && error "No files matched the selection criteria."
+  warn "No files selected — archive will be empty."
+fi
+
+# ── Dry-run / list mode ───────────────────────────────────────
+if [[ "$DRY_RUN" == true ]]; then
+  if [[ "$FILE_COUNT" -gt 0 ]]; then
+    cat "$TMP_FILE"
+  fi
+  if [[ "$LIST_ONLY" == true ]]; then
+    echo ""
+    echo "${C_BOLD}${FILE_COUNT} file(s) selected${C_RESET}"
+  fi
+  exit 0
+fi
+
+# ── Output collision check ────────────────────────────────────
+if [[ -f "$OUTPUT" && "$OVERWRITE" != true ]]; then
+  warn "Output file already exists: $OUTPUT"
+  if [[ -t 0 ]]; then
+    read -r -p "Overwrite? [y/N]: " _reply
+    [[ "${_reply:-}" =~ ^[Yy]$ ]] || error "Aborted. Use --overwrite to skip this prompt."
+  else
+    error "Output file exists: $OUTPUT. Use --overwrite to replace it."
+  fi
+fi
+
+ensure_archive_tools
+
+# ── Create archive ────────────────────────────────────────────
+log "Creating $FORMAT archive with $FILE_COUNT file(s) → $OUTPUT"
+
+if [[ "$FORMAT" == "zip" ]]; then
+  create_zip_archive "$TMP_FILE" "$OUTPUT"
+elif [[ "$FORMAT" == "tar.gz" ]]; then
+  create_targz_archive "$TMP_FILE" "$OUTPUT"
+fi
+
+# ── Summary ───────────────────────────────────────────────────
+FINAL_SIZE=""
+if [[ -f "$OUTPUT" ]]; then
+  RAW=$(file_size "$OUTPUT")
+  if   (( RAW >= 1048576 )); then FINAL_SIZE=" ($(( RAW / 1048576 ))MB)"
+  elif (( RAW >= 1024 ));    then FINAL_SIZE=" ($(( RAW / 1024 ))KB)"
+  else                            FINAL_SIZE=" (${RAW}B)"
+  fi
+fi
+
+ok "Archive created: ${C_BOLD}$OUTPUT${C_RESET}${FINAL_SIZE}  [${FILE_COUNT} file(s)]"
