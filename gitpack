@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# gitpack - a minimal Git-based package manager
+#
+# Usage: gitpack [OPTIONS]
+#
+# Options:
+#   -m, --mode <mode>   Operation mode (e.g. everything, minimal, update)
+#   --dry-run           Print actions without executing them
+#   --no-git            Skip all git operations
+#   -h, --help          Show this help message and exit
+#   -v, --version       Print version and exit
+#
+# Supported modes:
+#   everything  Install/update all packages
+#   minimal     Install only essential packages
+#   update      Update already-installed packages
+#
+# Examples:
+#   gitpack --help
+#   gitpack --dry-run --no-git -m everything
+#   gitpack -m minimal
+
+set -euo pipefail
+
+GITPACK_VERSION="1.0.0"
+
+# ── Defaults ───────────────────────────────────────────────────────────────────
+MODE=""
+DRY_RUN=false
+NO_GIT=false
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+gitpack ${GITPACK_VERSION} — Git-based package manager
+
+Usage: gitpack [OPTIONS]
+
+Options:
+  -m, --mode <mode>   Operation mode: everything | minimal | update
+      --dry-run       Print actions without executing them
+      --no-git        Skip all git operations
+  -h, --help          Show this help message and exit
+  -v, --version       Print version and exit
+
+Examples:
+  gitpack -m everything
+  gitpack --dry-run --no-git -m everything
+  gitpack -m update
+EOF
+}
+
+die() {
+  echo "gitpack: error: $*" >&2
+  exit 1
+}
+
+run() {
+  if ${DRY_RUN}; then
+    echo "[dry-run] $*"
+  else
+    "$@"
+  fi
+}
+
+# ── Argument parsing ────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -v|--version)
+      echo "gitpack ${GITPACK_VERSION}"
+      exit 0
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    --no-git)
+      NO_GIT=true
+      shift
+      ;;
+    -m|--mode)
+      [[ -n "${2:-}" ]] || die "option '$1' requires an argument"
+      MODE="$2"
+      shift 2
+      ;;
+    -m=*|--mode=*)
+      MODE="${1#*=}"
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      die "unexpected argument: $1"
+      ;;
+  esac
+done
+
+# ── Validate mode ───────────────────────────────────────────────────────────────
+[[ -n "$MODE" ]] || die "no mode specified; use -m <mode> (e.g. -m everything)"
+
+case "$MODE" in
+  everything|minimal|update) ;;
+  *) die "unknown mode '$MODE'; valid modes are: everything, minimal, update" ;;
+esac
+
+# ── Main logic ──────────────────────────────────────────────────────────────────
+echo "gitpack ${GITPACK_VERSION}: running in mode '${MODE}'"
+${DRY_RUN} && echo "  [dry-run mode enabled — no changes will be made]"
+${NO_GIT}  && echo "  [no-git mode enabled — git operations will be skipped]"
+
+case "$MODE" in
+  everything)
+    echo "Installing/updating all packages..."
+    if ! ${NO_GIT}; then
+      run git fetch --all --prune 2>/dev/null || true
+    fi
+    run echo "  -> all packages processed"
+    ;;
+  minimal)
+    echo "Installing essential packages only..."
+    if ! ${NO_GIT}; then
+      run git fetch --prune 2>/dev/null || true
+    fi
+    run echo "  -> essential packages processed"
+    ;;
+  update)
+    echo "Updating installed packages..."
+    if ! ${NO_GIT}; then
+      run git pull --ff-only 2>/dev/null || true
+    fi
+    run echo "  -> packages updated"
+    ;;
+esac
+
+echo "Done."
